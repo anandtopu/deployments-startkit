@@ -1,0 +1,238 @@
+name: Reusable AWS ECS CI/CD
+
+on:
+  workflow_call:
+    inputs:
+      project_name:
+        required: true
+        type: string
+      aws_region:
+        required: true
+        type: string
+      ecr_repository:
+        required: true
+        type: string
+      container_port:
+        required: true
+        type: number
+      tf_state_bucket:
+        required: true
+        type: string
+      tf_lock_table:
+        required: true
+        type: string
+      terraform_working_directory:
+        required: false
+        type: string
+        default: infra
+      environment_prefix:
+        required: false
+        type: string
+        default: uat
+      run_deployment:
+        required: false
+        type: boolean
+        default: true
+      ci_command:
+        required: false
+        type: string
+        default: echo "No CI command configured"
+      uat_test_command:
+        required: false
+        type: string
+        default: echo "No UAT test command configured"
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ inputs.aws_region }}
+  PROJECT_NAME: ${{ inputs.project_name }}
+  ECR_REPOSITORY: ${{ inputs.ecr_repository }}
+  CONTAINER_PORT: ${{ inputs.container_port }}
+  ENVIRONMENT_NAME: ${{ inputs.environment_prefix }}-${{ github.run_id }}
+  TF_STATE_KEY: ${{ inputs.environment_prefix }}/${{ inputs.project_name }}/${{ github.run_id }}.tfstate
+
+jobs:
+  ci:
+    name: CI tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare reports folder
+        run: mkdir -p reports
+
+      - name: Run CI command
+        shell: bash
+        run: ${{ inputs.ci_command }}
+
+      - name: Upload CI reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-reports
+          path: reports/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  build_push:
+    name: Build and push image
+    needs: ci
+    if: inputs.run_deployment
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker build -t "${IMAGE_URI}" .
+          docker push "${IMAGE_URI}"
+          echo "image_uri=${IMAGE_URI}" >> "${GITHUB_OUTPUT}"
+
+  deploy_uat:
+    name: Deploy temporary UAT stack
+    needs: build_push
+    runs-on: ubuntu-latest
+    environment: uat
+    outputs:
+      app_url: ${{ steps.terraform_output.outputs.app_url }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.terraform_working_directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform init
+        shell: bash
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ inputs.tf_state_bucket }}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="dynamodb_table=${{ inputs.tf_lock_table }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform apply
+        shell: bash
+        run: |
+          terraform apply -auto-approve \
+            -var="project_name=${PROJECT_NAME}" \
+            -var="environment=${ENVIRONMENT_NAME}" \
+            -var="aws_region=${AWS_REGION}" \
+            -var="image_uri=${{ needs.build_push.outputs.image_uri }}" \
+            -var="container_port=${CONTAINER_PORT}"
+
+      - name: Capture app URL
+        id: terraform_output
+        shell: bash
+        run: |
+          APP_URL="$(terraform output -raw app_url)"
+          echo "app_url=${APP_URL}" >> "${GITHUB_OUTPUT}"
+          echo "Deployed app URL: ${APP_URL}"
+
+  uat_tests:
+    name: UAT, E2E, and regression tests
+    needs: deploy_uat
+    runs-on: ubuntu-latest
+    env:
+      APP_BASE_URL: ${{ needs.deploy_uat.outputs.app_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare reports folder
+        run: mkdir -p reports
+
+      - name: Run UAT command
+        shell: bash
+        run: ${{ inputs.uat_test_command }}
+
+      - name: Upload UAT reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uat-reports
+          path: reports/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  cleanup:
+    name: Cleanup temporary UAT stack
+    needs: [build_push, deploy_uat, uat_tests]
+    if: always() && inputs.run_deployment
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.terraform_working_directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform init
+        shell: bash
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ inputs.tf_state_bucket }}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="dynamodb_table=${{ inputs.tf_lock_table }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform destroy
+        shell: bash
+        run: |
+          terraform destroy -auto-approve \
+            -var="project_name=${PROJECT_NAME}" \
+            -var="environment=${ENVIRONMENT_NAME}" \
+            -var="aws_region=${AWS_REGION}" \
+            -var="image_uri=${{ needs.build_push.outputs.image_uri || 'placeholder' }}" \
+            -var="container_port=${CONTAINER_PORT}"

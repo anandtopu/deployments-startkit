@@ -1,0 +1,19 @@
+aws_region     = "us-east-1"
+project_name   = "myapp"
+environment    = "uat-local"
+image_uri      = "123456789012.dkr.ecr.us-east-1.amazonaws.com/myapp:replace-me"
+container_port = 8080
+
+desired_count     = 1
+task_cpu          = 256
+task_memory       = 512
+health_check_path = "/"
+
+app_environment_variables = {
+  APP_ENV = "uat"
+}
+
+tags = {
+  Owner = "your-name"
+}
+

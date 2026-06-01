@@ -1,0 +1,33 @@
+name: Low-cost AWS ECS CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"
+
+jobs:
+  pipeline:
+    uses: ./.github/workflows/reusable-aws-ecs-cicd.yml
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+    with:
+      project_name: myapp
+      run_deployment: ${{ github.event_name != 'pull_request' }}
+      aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      ecr_repository: ${{ vars.ECR_REPOSITORY || 'myapp' }}
+      container_port: ${{ fromJSON(vars.CONTAINER_PORT || '8080') }}
+      tf_state_bucket: ${{ vars.TF_STATE_BUCKET }}
+      tf_lock_table: ${{ vars.TF_LOCK_TABLE }}
+      ci_command: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        if [ -f requirements-test.txt ]; then pip install -r requirements-test.txt; fi
+        if [ -d tests ]; then pytest tests -m "not e2e" --junitxml=reports/ci.xml; fi
+      uat_test_command: |
+        echo "Running UAT tests against ${APP_BASE_URL}"
+        if [ -f requirements-test.txt ]; then pip install -r requirements-test.txt; fi
+        if [ -d tests ]; then pytest tests --junitxml=reports/uat.xml; fi

@@ -1,0 +1,34 @@
+flowchart TD
+  Dev["Developer pushes code or opens PR"] --> Repo["GitHub repository"]
+  Repo --> Workflow["GitHub Actions workflow"]
+
+  Workflow --> CI["CI job: checkout, lint, unit tests"]
+  CI --> IT["Integration job: Docker Compose or service containers"]
+  IT --> Build["Build Docker image"]
+  Build --> OIDC["Assume AWS role with GitHub OIDC"]
+  OIDC --> ECR["Push image to Amazon ECR"]
+  ECR --> TFApply["Terraform/OpenTofu apply"]
+  TFApply --> AWSStack["Temporary AWS UAT stack"]
+
+  subgraph AWS["AWS account"]
+    IAM["IAM OIDC provider and deploy role"]
+    ECR
+    VPC["VPC with public subnets"]
+    ALB["Application Load Balancer"]
+    ECS["ECS Fargate service"]
+    Logs["CloudWatch Logs"]
+    State["S3 Terraform state bucket"]
+    Lock["DynamoDB state lock table"]
+  end
+
+  AWSStack --> VPC
+  VPC --> ALB
+  ALB --> ECS
+  ECS --> Logs
+  TFApply --> State
+  TFApply --> Lock
+  OIDC --> IAM
+
+  ECS --> Test["Run smoke, E2E, regression, UAT tests"]
+  Test --> Cleanup["Always run cleanup job"]
+  Cleanup --> TFDestroy["Terraform/OpenTofu destroy"]

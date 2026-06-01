@@ -1,0 +1,6 @@
+bucket         = "myapp-tfstate-123456789012-us-east-1"
+key            = "uat/myapp/manual-test.tfstate"
+region         = "us-east-1"
+dynamodb_table = "myapp-tf-locks"
+encrypt        = true
+
